@@ -62,6 +62,16 @@ from .factories import (
     SafeMasterCopyFactory,
     SafeStatusFactory,
 )
+from .mocks.mocks_safe_creation import (
+    create_cpk_test_data,
+    create_test_data_v1_0_0,
+    create_test_data_v1_1_1,
+    create_v1_4_1_test_data,
+    data_decoded_cpk,
+    data_decoded_v1_0_0,
+    data_decoded_v1_1_1,
+    data_decoded_v1_4_1,
+)
 from .mocks.traces import call_trace
 
 logger = logging.getLogger(__name__)
@@ -788,6 +798,7 @@ class TestViews(SafeTestCaseMixin, APITestCase):
             "b1b3b164cf000000000000000000000000000000000000000000000000000000"
             "0000000001"
         )
+
         multisig_tx = MultisigTransactionFactory(data=add_owner_with_threshold_data)
         safe_tx_hash = multisig_tx.safe_tx_hash
         response = self.client.get(
@@ -804,6 +815,7 @@ class TestViews(SafeTestCaseMixin, APITestCase):
         self.assertFalse(response.data["trusted"])
         self.assertIsNone(response.data["max_fee_per_gas"])
         self.assertIsNone(response.data["max_priority_fee_per_gas"])
+        self.assertIsNone(response.data["proposer"])
         self.assertEqual(
             response.data["data_decoded"],
             {
@@ -818,6 +830,7 @@ class TestViews(SafeTestCaseMixin, APITestCase):
                 ],
             },
         )
+
         # Test camelCase
         self.assertEqual(
             response.json()["transactionHash"], multisig_tx.ethereum_tx.tx_hash
@@ -845,16 +858,28 @@ class TestViews(SafeTestCaseMixin, APITestCase):
         self.assertEqual(response.data["origin"], json.dumps(origin))
         self.assertEqual(json.loads(response.data["origin"]), origin)
 
+        # Test proposer
+        proposer = Account.create().address
+        multisig_tx.proposer = proposer
+        multisig_tx.save()
+        response = self.client.get(
+            reverse("v1:history:multisig-transaction", args=(safe_tx_hash,)),
+            format="json",
+        )
+        self.assertEqual(response.data["proposer"], proposer)
+
     def test_get_multisig_transactions(self):
         safe_address = Account.create().address
+        proposer = Account.create().address
         response = self.client.get(
             reverse("v1:history:multisig-transactions", args=(safe_address,)),
             format="json",
         )
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual(response.data["count"], 0)
+        self.assertEqual(response.data["count_unique_nonce"], 0)
 
-        multisig_tx = MultisigTransactionFactory(safe=safe_address)
+        multisig_tx = MultisigTransactionFactory(safe=safe_address, proposer=proposer)
         response = self.client.get(
             reverse("v1:history:multisig-transactions", args=(safe_address,)),
             format="json",
@@ -878,7 +903,6 @@ class TestViews(SafeTestCaseMixin, APITestCase):
         )
         # Check Etag header
         self.assertTrue(response["Etag"])
-
         MultisigConfirmationFactory(multisig_transaction=multisig_tx)
         response = self.client.get(
             reverse("v1:history:multisig-transactions", args=(safe_address,)),
@@ -887,6 +911,7 @@ class TestViews(SafeTestCaseMixin, APITestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual(len(response.data["results"]), 1)
         self.assertEqual(len(response.data["results"][0]["confirmations"]), 1)
+        self.assertEqual(response.data["results"][0]["proposer"], proposer)
 
         MultisigTransactionFactory(safe=safe_address, nonce=multisig_tx.nonce)
         response = self.client.get(
@@ -895,6 +920,39 @@ class TestViews(SafeTestCaseMixin, APITestCase):
         )
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual(response.data["count"], 2)
+        self.assertEqual(response.data["count_unique_nonce"], 1)
+
+    def test_get_multisig_transactions_unique_nonce(self):
+        """
+        Unique nonce should follow the trusted filter
+        """
+
+        safe_address = Account.create().address
+        url = reverse("v1:history:multisig-transactions", args=(safe_address,))
+        response = self.client.get(
+            url,
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["count"], 0)
+        self.assertEqual(response.data["count_unique_nonce"], 0)
+
+        MultisigTransactionFactory(safe=safe_address, nonce=6, trusted=True)
+        MultisigTransactionFactory(safe=safe_address, nonce=12, trusted=False)
+        response = self.client.get(
+            url,
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["count"], 2)
+        self.assertEqual(response.data["count_unique_nonce"], 2)
+
+        response = self.client.get(
+            url + "?trusted=True",
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["count"], 1)
         self.assertEqual(response.data["count_unique_nonce"], 1)
 
     @mock.patch.object(
@@ -1138,6 +1196,7 @@ class TestViews(SafeTestCaseMixin, APITestCase):
         self.assertEqual(len(response.data["results"]), 1)
         self.assertIsNone(response.data["results"][0]["executor"])
         self.assertEqual(len(response.data["results"][0]["confirmations"]), 0)
+        self.assertEqual(response.data["results"][0]["proposer"], data["sender"])
 
         # Test confirmation with signature
         data["signature"] = safe_owner_1.signHash(safe_tx.safe_tx_hash)[
@@ -1618,11 +1677,16 @@ class TestViews(SafeTestCaseMixin, APITestCase):
             response.data["non_field_errors"][0],
         )
 
-        # Add delegate
-        SafeContractDelegateFactory(
+        # Add delegates (to check there's no issue with delegating twice to the same account)
+        safe_contract_delegate = SafeContractDelegateFactory(
             safe_contract__address=safe_address,
             delegate=safe_delegate.address,
             delegator=safe_owners[0].address,
+        )
+        SafeContractDelegateFactory(
+            safe_contract=safe_contract_delegate.safe_contract,
+            delegate=safe_delegate.address,
+            delegator=safe_owners[1].address,
         )
         response = self.client.post(
             reverse("v1:history:multisig-transactions", args=(safe_address,)),
@@ -1632,7 +1696,11 @@ class TestViews(SafeTestCaseMixin, APITestCase):
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
         self.assertEqual(MultisigTransaction.objects.count(), 1)
         self.assertEqual(MultisigConfirmation.objects.count(), 0)
-        self.assertTrue(MultisigTransaction.objects.first().trusted)
+        multisig_transaction = MultisigTransaction.objects.first()
+        self.assertTrue(multisig_transaction.trusted)
+        # Proposer should be the owner address not the delegate
+        self.assertNotEqual(multisig_transaction.proposer, safe_delegate.address)
+        self.assertEqual(multisig_transaction.proposer, safe_owners[0].address)
 
         data["signature"] = data["signature"] + data["signature"][2:]
         response = self.client.post(
@@ -1904,9 +1972,13 @@ class TestViews(SafeTestCaseMixin, APITestCase):
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
 
         self.assertEqual(SafeContractDelegate.objects.count(), 2)
+        queryset = SafeContractDelegate.objects.get_for_safe(
+            safe_address, [delegator.address]
+        )
+        self.assertEqual(len(queryset), 2)
         self.assertCountEqual(
-            SafeContractDelegate.objects.get_delegates_for_safe(safe_address),
-            [delegate.address],
+            set(safe_contract_delegate.delegate for safe_contract_delegate in queryset),
+            {delegate.address},
         )
 
     def test_delegates_get(self):
@@ -2899,123 +2971,37 @@ class TestViews(SafeTestCaseMixin, APITestCase):
             return_value=[another_trace, another_trace_2],
         ):
             # `another_trace_2` should change the `creator` and `master_copy` and `setup_data` should appear
-            # Taken from rinkeby
-            create_test_data = {
-                "master_copy": "0xb6029EA3B2c51D09a50B53CA8012FeEB05bDa35A",
-                "setup_data": "0xa97ab18a00000000000000000000000000000000000000000000000000000000000000e000000000000000000000000000000000000000000000000000000000000000010000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000016000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000030000000000000000000000006e45d69a383ceca3d54688e833bd0e1388747e6b00000000000000000000000061a0c717d18232711bc788f19c9cd56a43cc88720000000000000000000000007724b234c9099c205f03b458944942bceba134080000000000000000000000000000000000000000000000000000000000000000",
-                "data": "0x61b69abd000000000000000000000000b6029ea3b2c51d09a50b53ca8012feeb05bda35a00000000000000000000000000000000000000000000000000000000000000400000000000000000000000000000000000000000000000000000000000000184a97ab18a00000000000000000000000000000000000000000000000000000000000000e000000000000000000000000000000000000000000000000000000000000000010000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000016000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000030000000000000000000000006e45d69a383ceca3d54688e833bd0e1388747e6b00000000000000000000000061a0c717d18232711bc788f19c9cd56a43cc88720000000000000000000000007724b234c9099c205f03b458944942bceba13408000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
-            }
-            data_decoded_1 = {
-                "method": "setup",
-                "parameters": [
-                    {
-                        "name": "_owners",
-                        "type": "address[]",
-                        "value": [
-                            "0x6E45d69a383CECa3d54688e833Bd0e1388747e6B",
-                            "0x61a0c717d18232711bC788F19C9Cd56a43cc8872",
-                            "0x7724b234c9099C205F03b458944942bcEBA13408",
-                        ],
-                    },
-                    {"name": "_threshold", "type": "uint256", "value": "1"},
-                    {
-                        "name": "to",
-                        "type": "address",
-                        "value": "0x0000000000000000000000000000000000000000",
-                    },
-                    {"name": "data", "type": "bytes", "value": "0x"},
-                    {
-                        "name": "paymentToken",
-                        "type": "address",
-                        "value": "0x0000000000000000000000000000000000000000",
-                    },
-                    {"name": "payment", "type": "uint256", "value": "0"},
-                    {
-                        "name": "paymentReceiver",
-                        "type": "address",
-                        "value": "0x0000000000000000000000000000000000000000",
-                    },
-                ],
-            }
-
-            create_test_data_2 = {
-                "master_copy": "0x34CfAC646f301356fAa8B21e94227e3583Fe3F5F",
-                "setup_data": "0xb63e800d0000000000000000000000000000000000000000000000000000000000000100000000000000000000000000000000000000000000000000000000000000000100000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000180000000000000000000000000d5d82b6addc9027b22dca772aa68d5d74cdbdf440000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000ac9b6dd409ff10000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000300000000000000000000000085c26101f353f38e45c72d414b44972831f07be3000000000000000000000000235518798770d7336c5c4908dd1019457fea43a10000000000000000000000007f63c25665ea7e85500eaeb806e552e651b07b9d00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
-                "data": "0x1688f0b900000000000000000000000034cfac646f301356faa8b21e94227e3583fe3f5f0000000000000000000000000000000000000000000000000000000000000060000000000000000000000000000000000000000000000000000002cecc9e861200000000000000000000000000000000000000000000000000000000000001c4b63e800d0000000000000000000000000000000000000000000000000000000000000100000000000000000000000000000000000000000000000000000000000000000100000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000180000000000000000000000000d5d82b6addc9027b22dca772aa68d5d74cdbdf440000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000ac9b6dd409ff10000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000300000000000000000000000085c26101f353f38e45c72d414b44972831f07be3000000000000000000000000235518798770d7336c5c4908dd1019457fea43a10000000000000000000000007f63c25665ea7e85500eaeb806e552e651b07b9d0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
-            }
-            data_decoded_2 = {
-                "method": "setup",
-                "parameters": [
-                    {
-                        "name": "_owners",
-                        "type": "address[]",
-                        "value": [
-                            "0x85C26101f353f38E45c72d414b44972831f07BE3",
-                            "0x235518798770D7336c5c4908dd1019457FEa43a1",
-                            "0x7F63c25665EA7e85500eAEB806E552e651B07b9d",
-                        ],
-                    },
-                    {"name": "_threshold", "type": "uint256", "value": "1"},
-                    {
-                        "name": "to",
-                        "type": "address",
-                        "value": "0x0000000000000000000000000000000000000000",
-                    },
-                    {"name": "data", "type": "bytes", "value": "0x"},
-                    {
-                        "name": "fallbackHandler",
-                        "type": "address",
-                        "value": "0xd5D82B6aDDc9027B22dCA772Aa68D5d74cdBdF44",
-                    },
-                    {
-                        "name": "paymentToken",
-                        "type": "address",
-                        "value": "0x0000000000000000000000000000000000000000",
-                    },
-                    {"name": "payment", "type": "uint256", "value": "3036537000337393"},
-                    {
-                        "name": "paymentReceiver",
-                        "type": "address",
-                        "value": "0x0000000000000000000000000000000000000000",
-                    },
-                ],
-            }
-
-            create_cpk_test_data = {
-                "master_copy": "0x34CfAC646f301356fAa8B21e94227e3583Fe3F5F",
-                "setup_data": "0x5714713d000000000000000000000000ff54516a7bc1c1ea952a688e72d5b93a80620074",
-                "data": "0x460868ca00000000000000000000000034cfac646f301356faa8b21e94227e3583fe3f5fcfe33a586323e7325be6aa6ecd8b4600d232a9037e83c8ece69413b777dabe6500000000000000000000000040a930851bd2e590bd5a5c981b436de25742e9800000000000000000000000005ef44de4b98f2bce0e29c344e7b2fb8f0282a0cf000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000e0000000000000000000000000000000000000000000000000000000000000000100000000000000000000000000000000000000000000000000000000000000245714713d000000000000000000000000ff54516a7bc1c1ea952a688e72d5b93a8062007400000000000000000000000000000000000000000000000000000000",
-            }
-            data_decoded_cpk = None
 
             for test_data, data_decoded in [
-                (create_test_data, data_decoded_1),
-                (create_test_data_2, data_decoded_2),
+                (create_test_data_v1_0_0, data_decoded_v1_0_0),
+                (create_test_data_v1_1_1, data_decoded_v1_1_1),
                 (create_cpk_test_data, data_decoded_cpk),
+                (create_v1_4_1_test_data, data_decoded_v1_4_1),
             ]:
-                another_trace_2["action"]["input"] = HexBytes(test_data["data"])
-                response = self.client.get(
-                    reverse("v1:history:safe-creation", args=(owner_address,)),
-                    format="json",
-                )
-                self.assertEqual(response.status_code, status.HTTP_200_OK)
-                created_iso = (
-                    internal_tx.ethereum_tx.block.timestamp.isoformat().replace(
-                        "+00:00", "Z"
+                with self.subTest(test_data=test_data, data_decoded=data_decoded):
+                    another_trace_2["action"]["input"] = HexBytes(test_data["data"])
+                    response = self.client.get(
+                        reverse("v1:history:safe-creation", args=(owner_address,)),
+                        format="json",
                     )
-                )
-                self.assertEqual(
-                    response.data,
-                    {
-                        "created": created_iso,
-                        "creator": another_trace_2["action"]["from"],
-                        "transaction_hash": internal_tx.ethereum_tx_id,
-                        "factory_address": internal_tx._from,
-                        "master_copy": test_data["master_copy"],
-                        "setup_data": test_data["setup_data"],
-                        "data_decoded": data_decoded,
-                    },
-                )
+                    self.assertEqual(response.status_code, status.HTTP_200_OK)
+                    created_iso = (
+                        internal_tx.ethereum_tx.block.timestamp.isoformat().replace(
+                            "+00:00", "Z"
+                        )
+                    )
+                    self.assertEqual(
+                        response.data,
+                        {
+                            "created": created_iso,
+                            "creator": another_trace_2["action"]["from"],
+                            "transaction_hash": internal_tx.ethereum_tx_id,
+                            "factory_address": internal_tx._from,
+                            "master_copy": test_data["master_copy"],
+                            "setup_data": test_data["setup_data"],
+                            "data_decoded": data_decoded,
+                        },
+                    )
 
     def test_safe_info_view(self):
         invalid_address = "0x2A"
@@ -3169,8 +3155,8 @@ class TestViews(SafeTestCaseMixin, APITestCase):
         """
         SafeMasterCopy.objects.get_version_for_address.cache_clear()
 
-    def test_master_copies_view(self):
-        response = self.client.get(reverse("v1:history:master-copies"))
+    def _test_singletons_view(self, url: str):
+        response = self.client.get(url)
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual(response.data, [])
 
@@ -3180,7 +3166,7 @@ class TestViews(SafeTestCaseMixin, APITestCase):
             initial_block_number=deployed_block_number,
             tx_block_number=last_indexed_block_number,
         )
-        response = self.client.get(reverse("v1:history:master-copies"))
+        response = self.client.get(url)
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         expected_master_copy = [
             {
@@ -3195,7 +3181,7 @@ class TestViews(SafeTestCaseMixin, APITestCase):
         self.assertCountEqual(response.data, expected_master_copy)
 
         safe_master_copy = SafeMasterCopyFactory(l2=True)
-        response = self.client.get(reverse("v1:history:master-copies"))
+        response = self.client.get(url)
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         expected_l2_master_copy = [
             {
@@ -3213,9 +3199,17 @@ class TestViews(SafeTestCaseMixin, APITestCase):
         )
 
         with self.settings(ETH_L2_NETWORK=True):
-            response = self.client.get(reverse("v1:history:master-copies"))
+            response = self.client.get(url)
             self.assertEqual(response.status_code, status.HTTP_200_OK)
             self.assertCountEqual(response.data, expected_l2_master_copy)
+
+    def test_singletons_view(self):
+        url = reverse("v1:history:singletons")
+        return self._test_singletons_view(url)
+
+    def test_master_copies_view(self):
+        url = reverse("v1:history:master-copies")
+        return self._test_singletons_view(url)
 
     def test_modules_view(self):
         invalid_address = "0x2A"
@@ -3336,6 +3330,19 @@ class TestViews(SafeTestCaseMixin, APITestCase):
         self.assertEqual(
             response.data, {"safe_tx_gas": str(estimate_tx_gas_mock.return_value)}
         )
+        with mock.patch(
+            "safe_transaction_service.history.views.settings.ETH_L2_NETWORK",
+            return_value=True,
+        ):
+            response = self.client.post(
+                reverse(
+                    "v1:history:multisig-transaction-estimate", args=(safe_address,)
+                ),
+                format="json",
+                data=data,
+            )
+            self.assertEqual(response.status_code, status.HTTP_200_OK)
+            self.assertEqual(response.data, {"safe_tx_gas": "0"})
 
         estimate_tx_gas_mock.side_effect = CannotEstimateGas
         response = self.client.post(

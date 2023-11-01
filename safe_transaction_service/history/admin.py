@@ -216,7 +216,7 @@ class InternalTxAdmin(BinarySearchAdmin):
 
 
 class InternalTxDecodedOfficialListFilter(admin.SimpleListFilter):
-    title = "Gnosis official Safes"
+    title = "Official Safes"
     parameter_name = "official_safes"
 
     def lookups(self, request, model_admin):
@@ -452,7 +452,6 @@ class ModuleTransactionAdmin(BinarySearchAdmin):
 class MonitoredAddressAdmin(BinarySearchAdmin):
     actions = ["reindex", "reindex_last_day", "reindex_last_week", "reindex_last_month"]
     list_display = ("address", "initial_block_number", "tx_block_number")
-    readonly_fields = ["initial_block_number"]
     search_fields = ["=address"]
 
     @admin.action(description="Reindex from initial block")

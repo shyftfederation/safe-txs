@@ -272,15 +272,19 @@ class EthereumBlockQuerySet(models.QuerySet):
             timestamp__lte=timezone.now() - datetime.timedelta(seconds=seconds)
         ).order_by("-timestamp")
 
-    def not_confirmed(self, to_block_number: Optional[int] = None):
+    def not_confirmed(self):
         """
         :param to_block_number:
         :return: Block not confirmed until ``to_block_number``, if provided
         """
         queryset = self.filter(confirmed=False)
-        if to_block_number is not None:
-            queryset = queryset.filter(number__lte=to_block_number)
         return queryset
+
+    def since_block(self, block_number: int):
+        return self.filter(number__gte=block_number)
+
+    def until_block(self, block_number: int):
+        return self.filter(number__lte=block_number)
 
 
 class EthereumBlock(models.Model):
@@ -1362,6 +1366,7 @@ class MultisigTransaction(TimeStampedModel):
     objects = MultisigTransactionManager.from_queryset(MultisigTransactionQuerySet)()
     safe_tx_hash = Keccak256Field(primary_key=True)
     safe = EthereumAddressV2Field(db_index=True)
+    proposer = EthereumAddressV2Field(null=True)
     ethereum_tx = models.ForeignKey(
         EthereumTx,
         null=True,
@@ -1601,7 +1606,7 @@ class SafeMasterCopyQueryset(models.QuerySet):
 class SafeMasterCopy(MonitoredAddress):
     objects = SafeMasterCopyManager.from_queryset(SafeMasterCopyQueryset)()
     version = models.CharField(max_length=20, validators=[validate_version])
-    deployer = models.CharField(max_length=50, default="Gnosis")
+    deployer = models.CharField(max_length=50, default="Safe")
     l2 = models.BooleanField(default=False)
 
     class Meta:
@@ -1710,25 +1715,33 @@ class SafeContract(models.Model):
 
 
 class SafeContractDelegateManager(models.Manager):
-    def get_delegates_for_safe(self, address: ChecksumAddress) -> Set[ChecksumAddress]:
-        return set(
-            self.filter(safe_contract_id=address)
-            .values_list("delegate", flat=True)
-            .distinct()
+    def get_for_safe(
+        self, safe_address: ChecksumAddress, owner_addresses: Sequence[ChecksumAddress]
+    ) -> QuerySet["SafeContractDelegate"]:
+        if not owner_addresses:
+            return self.none()
+
+        return self.filter(
+            # If safe_contract is null on SafeContractDelegate, delegates are valid for every Safe
+            Q(safe_contract_id=safe_address)
+            | Q(safe_contract=None)
+        ).filter(delegator__in=owner_addresses)
+
+    def get_for_safe_and_delegate(
+        self,
+        safe_address: ChecksumAddress,
+        owner_addresses: Sequence[ChecksumAddress],
+        delegate: ChecksumAddress,
+    ) -> QuerySet["SafeContractDelegate"]:
+        return self.get_for_safe(safe_address, owner_addresses).filter(
+            delegate=delegate
         )
 
     def get_delegates_for_safe_and_owners(
         self, safe_address: ChecksumAddress, owner_addresses: Sequence[ChecksumAddress]
     ) -> Set[ChecksumAddress]:
-        if not owner_addresses:
-            return set()
         return set(
-            self.filter(
-                # If safe_contract is null on SafeContractDelegate, delegates are valid for every Safe
-                Q(safe_contract_id=safe_address)
-                | Q(safe_contract=None)
-            )
-            .filter(delegator__in=owner_addresses)
+            self.get_for_safe(safe_address, owner_addresses)
             .values_list("delegate", flat=True)
             .distinct()
         )
@@ -1736,7 +1749,8 @@ class SafeContractDelegateManager(models.Manager):
 
 class SafeContractDelegate(models.Model):
     """
-    The owners of the Safe can add users so they can propose/retrieve txs as if they were the owners of the Safe
+    Owners (delegators) can delegate on delegates, so they can propose trusted transactions
+    in their name
     """
 
     objects = SafeContractDelegateManager()
@@ -1746,7 +1760,7 @@ class SafeContractDelegate(models.Model):
         related_name="safe_contract_delegates",
         null=True,
         default=None,
-    )
+    )  # If safe_contract is not defined, delegate is valid for every Safe which delegator is an owner
     delegate = EthereumAddressV2Field()
     delegator = EthereumAddressV2Field()  # Owner who created the delegate
     label = models.CharField(max_length=50)

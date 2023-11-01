@@ -136,7 +136,7 @@ class EventsIndexer(EthereumIndexer):
         to_block_number: int,
     ) -> List[LogReceipt]:
         """
-        It will get Safe events using all the Gnosis Safe topics for filtering.
+        It will get Safe events using all the Safe topics for filtering.
 
         :param addresses:
         :param from_block_number:
@@ -220,6 +220,7 @@ class EventsIndexer(EthereumIndexer):
         """
         for event_to_listen in self.events_to_listen[log_receipt["topics"][0].hex()]:
             # Try to decode using all the existing ABIs
+            # One topic can have multiple matching ABIs due to `indexed` elements changing how to decode it
             try:
                 return event_to_listen.process_log(log_receipt)
             except LogTopicError:

@@ -167,12 +167,22 @@ class IndexingView(GenericAPIView):
         return Response(status=status.HTTP_200_OK, data=serializer.data)
 
 
-class MasterCopiesView(ListAPIView):
+class SingletonsView(ListAPIView):
     serializer_class = serializers.MasterCopyResponseSerializer
     pagination_class = None
 
     def get_queryset(self):
         return SafeMasterCopy.objects.relevant()
+
+
+class MasterCopiesView(SingletonsView):
+    @swagger_auto_schema(
+        deprecated=True,
+        operation_description="Use `singletons` instead of `master-copies`",
+        responses={200: "Ok"},
+    )
+    def get(self, *args, **kwargs):
+        return super().get(*args, **kwargs)
 
 
 class AllTransactionsListView(ListAPIView):
@@ -606,9 +616,17 @@ class SafeMultisigTransactionListView(ListAPIView):
         )
 
     def get_unique_nonce(self, address: str):
-        return (
-            MultisigTransaction.objects.filter(safe=address).distinct("nonce").count()
+        """
+        :param address:
+        :return: Number of Multisig Transactions with different nonce
+        """
+        only_trusted = parse_boolean_query_param(
+            self.request.query_params.get("trusted", False)
         )
+        queryset = MultisigTransaction.objects.filter(safe=address)
+        if only_trusted:
+            queryset = queryset.filter(trusted=True)
+        return queryset.distinct("nonce").count()
 
     def get_serializer_class(self):
         """
@@ -1302,6 +1320,13 @@ class SafeMultisigTransactionEstimateView(GenericAPIView):
 
         if not SafeContract.objects.filter(address=address).exists():
             return Response(status=status.HTTP_404_NOT_FOUND)
+
+        # This endpoint is only needed for Safes < 1.3.0, so it should be disabled for L2 chains as they
+        # don't support Safes below that version
+        if settings.ETH_L2_NETWORK:
+            response_serializer = self.response_serializer(data={"safe_tx_gas": 0})
+            response_serializer.is_valid()
+            return Response(status=status.HTTP_200_OK, data=response_serializer.data)
 
         serializer = self.get_serializer(data=request.data)
         if serializer.is_valid():
