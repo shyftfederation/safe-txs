@@ -11,6 +11,7 @@ from django.contrib.auth.models import Permission
 from django.urls import reverse
 from django.utils import timezone
 
+import eth_abi
 from eth_account import Account
 from factory.fuzzy import FuzzyText
 from hexbytes import HexBytes
@@ -31,7 +32,6 @@ from safe_transaction_service.contracts.models import ContractQuerySet
 from safe_transaction_service.contracts.tests.factories import ContractFactory
 from safe_transaction_service.contracts.tx_decoder import DbTxDecoder
 from safe_transaction_service.tokens.models import Token
-from safe_transaction_service.tokens.services.price_service import PriceService
 from safe_transaction_service.tokens.tests.factories import TokenFactory
 
 from ...utils.redis import get_redis
@@ -314,6 +314,7 @@ class TestViews(SafeTestCaseMixin, APITestCase):
                 "symbol": token.symbol,
                 "decimals": token.decimals,
                 "logo_uri": token.get_full_logo_uri(),
+                "trusted": token.trusted,
             },
         )
         transfers_not_empty = [
@@ -1258,6 +1259,77 @@ class TestViews(SafeTestCaseMixin, APITestCase):
         )
         self.assertEqual(response.status_code, status.HTTP_422_UNPROCESSABLE_ENTITY)
 
+    def test_post_multisig_transaction_with_1271_signature(self):
+        account = Account.create()
+        safe_owner = self.deploy_test_safe(owners=[account.address])
+        safe = self.deploy_test_safe(owners=[safe_owner.address])
+
+        data = {
+            "to": account.address,
+            "value": 100000000000000000,
+            "data": None,
+            "operation": 0,
+            "nonce": 0,
+            "safeTxGas": 0,
+            "baseGas": 0,
+            "gasPrice": 0,
+            "gasToken": "0x0000000000000000000000000000000000000000",
+            "refundReceiver": "0x0000000000000000000000000000000000000000",
+            "sender": safe_owner.address,
+        }
+        safe_tx = safe.build_multisig_tx(
+            data["to"],
+            data["value"],
+            data["data"],
+            data["operation"],
+            data["safeTxGas"],
+            data["baseGas"],
+            data["gasPrice"],
+            data["gasToken"],
+            data["refundReceiver"],
+            safe_nonce=data["nonce"],
+        )
+        safe_tx_hash = safe_tx.safe_tx_hash
+        safe_tx_hash_preimage = safe_tx.safe_tx_hash_preimage
+
+        safe_owner_message_hash = safe_owner.get_message_hash(safe_tx_hash_preimage)
+        safe_owner_signature = account.signHash(safe_owner_message_hash)["signature"]
+        signature_1271 = (
+            signature_to_bytes(
+                0, int.from_bytes(HexBytes(safe_owner.address), byteorder="big"), 65
+            )
+            + eth_abi.encode(["bytes"], [safe_owner_signature])[32:]
+        )
+
+        data["contractTransactionHash"] = safe_tx_hash.hex()
+        data["signature"] = signature_1271.hex()
+
+        response = self.client.post(
+            reverse("v1:history:multisig-transactions", args=(safe.address,)),
+            format="json",
+            data=data,
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        multisig_transaction_db = MultisigTransaction.objects.get(
+            safe_tx_hash=safe_tx_hash
+        )
+        self.assertTrue(multisig_transaction_db.trusted)
+        self.assertEqual(MultisigConfirmation.objects.count(), 1)
+
+        # Test MultisigConfirmation endpoint
+        confirmation_data = {"signature": data["signature"]}
+        MultisigConfirmation.objects.all().delete()
+        response = self.client.post(
+            reverse(
+                "v1:history:multisig-transaction-confirmations",
+                args=(safe_tx_hash.hex(),),
+            ),
+            format="json",
+            data=confirmation_data,
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(MultisigConfirmation.objects.count(), 1)
+
     def test_post_multisig_transaction_with_trusted_user(self):
         safe_owner_1 = Account.create()
         safe = self.deploy_test_safe(owners=[safe_owner_1.address])
@@ -1796,23 +1868,13 @@ class TestViews(SafeTestCaseMixin, APITestCase):
         )
 
     @mock.patch.object(BalanceService, "get_token_info", autospec=True)
-    @mock.patch.object(
-        PriceService, "get_token_eth_value", return_value=0.4, autospec=True
-    )
-    @mock.patch.object(
-        PriceService, "get_native_coin_usd_price", return_value=123.4, autospec=True
-    )
     @mock.patch.object(timezone, "now", return_value=timezone.now())
     def test_safe_balances_usd_view(
         self,
         timezone_now_mock: MagicMock,
-        get_native_coin_usd_price_mock: MagicMock,
-        get_token_eth_value_mock: MagicMock,
         get_token_info_mock: MagicMock,
     ):
-        timestamp_str = timezone_now_mock.return_value.isoformat().replace(
-            "+00:00", "Z"
-        )
+        timestamp_str = "1970-01-01T00:00:00Z"
         safe_address = Account.create().address
         response = self.client.get(
             reverse("v1:history:safe-balances-usd", args=(safe_address,)), format="json"
@@ -1829,7 +1891,7 @@ class TestViews(SafeTestCaseMixin, APITestCase):
         self.assertEqual(len(response.data), 1)
         self.assertIsNone(response.data[0]["token_address"])
         self.assertEqual(response.data[0]["balance"], str(value))
-        self.assertEqual(response.data[0]["eth_value"], "1.0")
+        self.assertEqual(response.data[0]["eth_value"], "0.0")
 
         tokens_value = int(12 * 1e18)
         erc20 = self.deploy_example_erc20(tokens_value, safe_address)
@@ -1859,20 +1921,20 @@ class TestViews(SafeTestCaseMixin, APITestCase):
                     "token_address": None,
                     "token": None,
                     "balance": str(value),
-                    "eth_value": "1.0",
+                    "eth_value": "0.0",
                     "timestamp": timestamp_str,
                     "fiat_balance": "0.0",
-                    "fiat_conversion": "123.4",
+                    "fiat_conversion": "0.0",
                     "fiat_code": "USD",
                 },  # 7 wei is rounded to 0.0
                 {
                     "token_address": erc20.address,
                     "token": token_dict,
                     "balance": str(tokens_value),
-                    "eth_value": "0.4",
+                    "eth_value": "0.0",
                     "timestamp": timestamp_str,
-                    "fiat_balance": str(round(123.4 * 0.4 * (tokens_value / 1e18), 4)),
-                    "fiat_conversion": str(round(123.4 * 0.4, 4)),
+                    "fiat_balance": "0.0",
+                    "fiat_conversion": "0.0",
                     "fiat_code": "USD",
                 },
             ],
@@ -2336,6 +2398,7 @@ class TestViews(SafeTestCaseMixin, APITestCase):
                         "symbol": token.symbol,
                         "decimals": token.decimals,
                         "logoUri": token.get_full_logo_uri(),
+                        "trusted": token.trusted,
                     },
                 },
                 {
@@ -2411,6 +2474,7 @@ class TestViews(SafeTestCaseMixin, APITestCase):
                         "symbol": token.symbol,
                         "decimals": token.decimals,
                         "logoUri": token.get_full_logo_uri(),
+                        "trusted": token.trusted,
                     },
                 },
                 {
@@ -2580,6 +2644,7 @@ class TestViews(SafeTestCaseMixin, APITestCase):
                     "symbol": token.symbol,
                     "decimals": token.decimals,
                     "logoUri": token.get_full_logo_uri(),
+                    "trusted": token.trusted,
                 },
             },
             {
@@ -2867,6 +2932,7 @@ class TestViews(SafeTestCaseMixin, APITestCase):
                 "symbol": token.symbol,
                 "decimals": token.decimals,
                 "logoUri": token.get_full_logo_uri(),
+                "trusted": token.trusted,
             },
         }
         self.assertEqual(response.json(), expected_result)

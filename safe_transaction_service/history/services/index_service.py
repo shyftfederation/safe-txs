@@ -196,7 +196,6 @@ class IndexService:
     def txs_create_or_update_from_tx_hashes(
         self, tx_hashes: Collection[Union[str, bytes]]
     ) -> List["EthereumTx"]:
-
         logger.debug("Don't retrieve existing txs on DB. Find them first")
         # Search first in database
         ethereum_txs_dict = OrderedDict.fromkeys(
@@ -413,7 +412,7 @@ class IndexService:
                 else current_block_number
             )
             for block_number in range(
-                from_block_number, stop_block_number, block_process_limit
+                from_block_number, stop_block_number + 1, block_process_limit
             ):
                 elements = indexer.find_relevant_elements(
                     addresses,
