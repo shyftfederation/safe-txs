@@ -103,6 +103,12 @@ THIRD_PARTY_APPS = [
     "django_s3_storage",
     "rest_framework.authtoken",
 ]
+ALLAUTH_APPS = [
+    "allauth",
+    "allauth.account",
+    "allauth.socialaccount",
+    "allauth.socialaccount.providers.google",
+]
 LOCAL_APPS = [
     "safe_transaction_service.analytics.apps.AnalyticsConfig",
     "safe_transaction_service.contracts.apps.ContractsConfig",

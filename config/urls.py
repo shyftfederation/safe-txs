@@ -79,6 +79,7 @@ if settings.ENABLE_ANALYTICS:
 
 urlpatterns = swagger_urlpatterns + [
     path(settings.ADMIN_URL, admin.site.urls),
+    path("accounts/", include("allauth.urls")),
     path("api/v1/", include((urlpatterns_v1, "v1"))),
     path("api/v2/", include((urlpatterns_v2, "v2"))),
     path("check/", lambda request: HttpResponse("Ok"), name="check"),
